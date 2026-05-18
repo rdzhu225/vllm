@@ -33,6 +33,7 @@ QuantizationMethods = Literal[
     "mxfp4",
     "gpt_oss_mxfp4",
     "deepseek_v4_fp8",
+    "deepseek_v4_int4",
     "cpu_awq",
     "online",
     # Below are values of the OnlineQuantScheme enum, specified as strings to
@@ -116,6 +117,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from vllm.model_executor.models.deepseek_v4 import DeepseekV4FP8Config
 
     from .awq import AWQConfig
+    from .deepseek_v4_int4 import DeepseekV4Int4Config
     from .awq_marlin import AWQMarlinConfig
     from .bitsandbytes import BitsAndBytesConfig
     from .compressed_tensors.compressed_tensors import (
@@ -166,6 +168,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "mxfp4": Mxfp4Config,
         "gpt_oss_mxfp4": GptOssMxfp4Config,
         "deepseek_v4_fp8": DeepseekV4FP8Config,
+        "deepseek_v4_int4": DeepseekV4Int4Config,
         "cpu_awq": CPUAWQConfig,
         "humming": HummingConfig,
         "online": OnlineQuantizationConfig,
