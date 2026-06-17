@@ -630,13 +630,16 @@ class CompressedTensorsConfig(QuantizationConfig):
             return CompressedTensorsW8A8Mxfp8()
 
         if self._is_fp8_w4a8_sm90(weight_quant, input_quant):
-            return CompressedTensorsW4A8Fp8(
-                num_bits=weight_quant.num_bits,
-                strategy=weight_quant.strategy,
-                symmetric=weight_quant.symmetric,
-                group_size=weight_quant.group_size,
-                actorder=weight_quant.actorder,
-            )
+            # W4A8Fp8 expects pack-quantized format (int32-packed weights);
+            # int-quantized checkpoints store unpacked int8 and must use W4A8Int.
+            if format != CompressionFormat.int_quantized.value:
+                return CompressedTensorsW4A8Fp8(
+                    num_bits=weight_quant.num_bits,
+                    strategy=weight_quant.strategy,
+                    symmetric=weight_quant.symmetric,
+                    group_size=weight_quant.group_size,
+                    actorder=weight_quant.actorder,
+                )
 
         if (
             self._is_wNa16_group_channel(weight_quant, input_quant)

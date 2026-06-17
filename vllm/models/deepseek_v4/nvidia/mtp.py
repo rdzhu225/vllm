@@ -354,7 +354,7 @@ class DeepSeekV4MTP(nn.Module):
         # for the rename below based on the model's expert dtype.
         expert_scale_suffix = (
             ".weight_scale"
-            if getattr(self.config, "expert_dtype", "fp4") == "fp4"
+            if getattr(self.config, "expert_dtype", "fp4") in ("fp4", "int4")
             else ".weight_scale_inv"
         )
 

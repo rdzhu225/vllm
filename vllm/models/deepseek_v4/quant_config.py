@@ -12,7 +12,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
 )
 
-_DEEPSEEK_V4_EXPERT_DTYPES = ("fp4", "fp8")
+_DEEPSEEK_V4_EXPERT_DTYPES = ("fp4", "fp8", "int4")
 
 
 class DeepseekV4FP8Config(Fp8Config):
@@ -83,7 +83,15 @@ class DeepseekV4FP8Config(Fp8Config):
             and hf_quant_cfg.get("quant_method") in ("fp8", "deepseek_v4_fp8")
         ):
             return None
+        # INT4 expert checkpoints have BF16 non-expert weights despite
+        # declaring quant_method=fp8 in quantization_config. Defer to
+        # DeepseekV4Int4Config which uses UnquantizedLinearMethod for linears.
         model_type = getattr(hf_config, "model_type", None)
+        expert_dtype = getattr(hf_config, "expert_dtype", None)
+        if model_type == "deepseek_v4" and expert_dtype == "int4":
+            return None
+        if user_quant == "deepseek_v4_int4":
+            return None
         if model_type == "deepseek_v4" or user_quant == "deepseek_v4_fp8":
             return "deepseek_v4_fp8"
         return None
@@ -98,6 +106,11 @@ class DeepseekV4FP8Config(Fp8Config):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             if self.expert_dtype == "fp4":
                 return Mxfp4MoEMethod(layer.moe_config)
+            if self.expert_dtype == "int4":
+                from vllm.model_executor.layers.quantization.deepseek_v4_int4 import (
+                    DeepseekV4Int4MoEMethod,
+                )
+                return DeepseekV4Int4MoEMethod(layer.moe_config)
             # expert_dtype == "fp8": fall through to Fp8Config which
             # returns Fp8MoEMethod with block-wise float32 scales.
         return super().get_quant_method(layer, prefix)
