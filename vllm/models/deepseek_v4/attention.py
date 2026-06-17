@@ -86,6 +86,218 @@ logger = init_logger(__name__)
 PREFILL_CHUNK_SIZE = 4
 
 
+def _bf16_qnorm_rope_kv_insert(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    swa_kv_cache_2d: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    eps: float,
+    block_size: int,
+    nope_head_dim: int,
+    rope_head_dim: int,
+) -> None:
+    """BF16 fallback for Q-norm + GPT-J RoPE + KV cache insert.
+
+    Q side: per-head RMSNorm (no weight) + GPT-J RoPE (in-place).
+    KV side: GPT-J RoPE on rope portion + BF16 paged cache insert.
+    """
+    head_dim = nope_head_dim + rope_head_dim
+    num_tokens = q.shape[0]
+    # q may be 3D [T, H, D] or 2D [T, H*D]
+    if q.dim() == 3:
+        q_3d = q
+        num_heads = q.shape[1]
+    else:
+        num_heads = q.shape[1] // head_dim
+        q_3d = q.view(num_tokens, num_heads, head_dim)
+    variance = q_3d.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+    q_3d.copy_((q_3d * torch.rsqrt(variance + eps)).to(q.dtype))
+
+    # GPT-J RoPE on Q rope portion
+    half_rot = rope_head_dim // 2
+    cos = cos_sin_cache[positions, :half_rot]  # [T, half_rot]
+    sin = cos_sin_cache[positions, half_rot:]  # [T, half_rot]
+
+    q_rope = q_3d[:, :, nope_head_dim:]  # [T, H, rope_dim]
+    q_even = q_rope[:, :, 0::2]  # [T, H, half_rot]
+    q_odd = q_rope[:, :, 1::2]   # [T, H, half_rot]
+    cos_q = cos[:, None, :]  # [T, 1, half_rot]
+    sin_q = sin[:, None, :]  # [T, 1, half_rot]
+    new_even = q_even * cos_q - q_odd * sin_q
+    new_odd = q_odd * cos_q + q_even * sin_q
+    q_rope[:, :, 0::2] = new_even.to(q.dtype)
+    q_rope[:, :, 1::2] = new_odd.to(q.dtype)
+
+    # KV: GPT-J RoPE on rope portion (kv is [T, head_dim])
+    kv_rope = kv[:, nope_head_dim:]  # [T, rope_dim]
+    kv_even = kv_rope[:, 0::2]  # [T, half_rot]
+    kv_odd = kv_rope[:, 1::2]   # [T, half_rot]
+    new_kv_even = kv_even * cos - kv_odd * sin
+    new_kv_odd = kv_odd * cos + kv_even * sin
+    kv_rope[:, 0::2] = new_kv_even.to(kv.dtype)
+    kv_rope[:, 1::2] = new_kv_odd.to(kv.dtype)
+
+    # BF16 paged cache insert
+    # swa_kv_cache_2d is [num_blocks, block_size * head_dim] (bfloat16)
+    total_slots = swa_kv_cache_2d.shape[0] * block_size
+    cache_bf16 = swa_kv_cache_2d.view(total_slots, head_dim)
+
+    valid_mask = slot_mapping >= 0
+    valid_slots = slot_mapping[valid_mask]
+    valid_kv = kv[valid_mask]
+    cache_bf16[valid_slots] = valid_kv
+
+
+def _bf16_sparse_decode(
+    q: torch.Tensor,
+    swa_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_lens: torch.Tensor,
+    softmax_scale: float,
+    attn_sink: torch.Tensor,
+    head_dim_v: int,
+    extra_k_cache: torch.Tensor | None = None,
+    extra_indices: torch.Tensor | None = None,
+    extra_lens: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Pure-PyTorch BF16 sparse decode attention (correctness prototype).
+
+    Replaces flash_mla_with_kvcache for BF16 KV cache path.
+
+    Args:
+        q: (batch, 1, num_heads, head_dim) bf16
+        swa_cache: (num_blocks, block_size, 1, head_bytes) uint8-viewed bf16
+            Flatten to (total_slots, head_dim) bf16 for gathering.
+        swa_indices: (batch, 1, swa_topk) int32 — flat slot indices into swa_cache
+        swa_lens: (batch,) int32 — valid count per query for swa
+        softmax_scale: float
+        attn_sink: (num_heads,) float32
+        head_dim_v: int (512)
+        extra_k_cache: optional (num_blocks, block_size, 1, head_bytes)
+        extra_indices: optional (batch, 1, extra_topk) int32
+        extra_lens: optional (batch,) int32
+        output: optional pre-allocated (batch, 1, num_heads, head_dim_v)
+
+    Returns:
+        output: (batch, 1, num_heads, head_dim_v) bf16
+    """
+    batch, seq_q, num_heads, head_dim = q.shape
+    assert seq_q == 1
+    device = q.device
+
+    # Flatten SWA cache to (total_slots, kv_head_dim) bf16
+    # swa_cache is (num_blocks, block_size, 1, D) where D is head_dim (bf16 dtype)
+    num_blocks, block_size = swa_cache.shape[0], swa_cache.shape[1]
+    kv_head_dim = swa_cache.shape[3]  # already bf16 elements, not bytes
+    swa_flat = swa_cache.reshape(num_blocks * block_size, kv_head_dim)  # (total_slots, kv_head_dim)
+
+    # Gather SWA KV: swa_indices is (batch, swa_topk) or (batch, 1, swa_topk)
+    if swa_indices.dim() == 3:
+        swa_idx_2d = swa_indices.squeeze(1)  # (batch, swa_topk)
+    else:
+        swa_idx_2d = swa_indices  # already (batch, swa_topk)
+    swa_topk = swa_idx_2d.shape[1]
+    # Clamp negative indices to 0 (will be masked out)
+    idx_clamped = swa_idx_2d.clamp(min=0)  # (batch, swa_topk)
+
+    # Gather: (batch, swa_topk, kv_head_dim)
+    swa_kv = swa_flat[idx_clamped.long()]  # advanced indexing
+
+    # Build validity mask from swa_lens: (batch, swa_topk)
+    positions_range = torch.arange(swa_topk, device=device).unsqueeze(0)
+    swa_valid = positions_range < swa_lens.unsqueeze(1)  # (batch, swa_topk)
+    # Also mask out originally-negative indices
+    swa_valid = swa_valid & (swa_idx_2d >= 0)
+
+    # Handle extra (compressed) cache if present
+    if extra_k_cache is not None and extra_indices is not None and extra_lens is not None:
+        extra_num_blocks, extra_block_size = extra_k_cache.shape[0], extra_k_cache.shape[1]
+        extra_kv_head_dim = extra_k_cache.shape[3]  # already bf16 elements
+        extra_flat = extra_k_cache.reshape(
+            extra_num_blocks * extra_block_size, extra_kv_head_dim
+        )  # (total_extra_slots, extra_kv_head_dim)
+
+        if extra_indices.dim() == 3:
+            extra_idx_2d = extra_indices.squeeze(1)
+        else:
+            extra_idx_2d = extra_indices
+        extra_topk = extra_idx_2d.shape[1]
+        extra_idx_clamped = extra_idx_2d.clamp(min=0)  # (batch, extra_topk)
+        extra_kv = extra_flat[extra_idx_clamped.long()]  # (batch, extra_topk, extra_kv_head_dim)
+
+        extra_positions_range = torch.arange(extra_topk, device=device).unsqueeze(0)
+        extra_valid = extra_positions_range < extra_lens.unsqueeze(1)
+        extra_valid = extra_valid & (extra_idx_2d >= 0)
+
+        # Concatenate SWA and extra along the token dimension
+        # Pad to same kv_head_dim if needed (they should match for MLA)
+        if extra_kv_head_dim != kv_head_dim:
+            # Pad the smaller one — in practice both should be head_dim
+            max_dim = max(kv_head_dim, extra_kv_head_dim)
+            if kv_head_dim < max_dim:
+                swa_kv = F.pad(swa_kv, (0, max_dim - kv_head_dim))
+            if extra_kv_head_dim < max_dim:
+                extra_kv = F.pad(extra_kv, (0, max_dim - extra_kv_head_dim))
+            kv_head_dim = max_dim
+
+        all_kv = torch.cat([swa_kv, extra_kv], dim=1)  # (batch, swa_topk+extra_topk, kv_head_dim)
+        all_valid = torch.cat([swa_valid, extra_valid], dim=1)  # (batch, total_topk)
+    else:
+        all_kv = swa_kv
+        all_valid = swa_valid
+
+    total_kv_len = all_kv.shape[1]
+
+    # Q×K^T: q is (batch, 1, num_heads, head_dim), K is (batch, total_kv_len, kv_head_dim)
+    # In MLA, Q head_dim should match kv_head_dim for the dot product
+    q_squeezed = q.squeeze(1)  # (batch, num_heads, head_dim)
+    # Truncate or pad Q to match kv_head_dim if needed
+    if head_dim > kv_head_dim:
+        q_for_attn = q_squeezed[:, :, :kv_head_dim]
+    elif head_dim < kv_head_dim:
+        q_for_attn = F.pad(q_squeezed, (0, kv_head_dim - head_dim))
+    else:
+        q_for_attn = q_squeezed
+
+    # scores: (batch, num_heads, total_kv_len)
+    # q_for_attn: (batch, num_heads, kv_head_dim)
+    # all_kv: (batch, total_kv_len, kv_head_dim)
+    scores = torch.einsum("bhd,btd->bht", q_for_attn.float(), all_kv.float())
+    scores = scores * softmax_scale
+
+    # Mask invalid positions
+    invalid_mask = ~all_valid.unsqueeze(1).expand_as(scores)  # (batch, num_heads, total_kv_len)
+    scores.masked_fill_(invalid_mask, float("-inf"))
+
+    # Apply attn_sink: output = softmax(scores) * exp(lse) / (exp(lse) + exp(attn_sink))
+    # attn_sink shape: (num_heads,) — acts as a bias that dampens the output
+    # First compute standard softmax
+    attn_weights = torch.softmax(scores, dim=-1)  # (batch, num_heads, total_kv_len)
+
+    # Apply attn_sink scaling: scale output by sigmoid(lse - attn_sink)
+    # where lse = logsumexp(scores). This is equivalent to:
+    # out *= exp(lse) / (exp(lse) + exp(attn_sink)) = sigmoid(lse - attn_sink)
+    if attn_sink is not None:
+        lse = torch.logsumexp(scores, dim=-1)  # (batch, num_heads)
+        sink_scale = torch.sigmoid(lse - attn_sink.unsqueeze(0))  # (batch, num_heads)
+        attn_weights = attn_weights * sink_scale.unsqueeze(-1)
+
+    # V = K in MLA (first head_dim_v dims)
+    v = all_kv[:, :, :head_dim_v].float()  # (batch, total_kv_len, head_dim_v)
+
+    # output: (batch, num_heads, head_dim_v)
+    out = torch.einsum("bht,btd->bhd", attn_weights, v)
+    out = out.to(torch.bfloat16).unsqueeze(1)  # (batch, 1, num_heads, head_dim_v)
+
+    if output is not None:
+        output.copy_(out)
+        return output
+    return out
+
+
 @dataclass
 class DeepseekV4MLAModules:
     """Modules used in DeepseekV4 MLA."""
@@ -215,13 +427,20 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # Per-head RMS normalization for Q (no learnable weights)
         self.q_head_norm = RMSNorm(head_dim, eps=self.eps, has_weight=False)
 
+        assert cache_config is not None, "DeepseekV4 attention requires cache_config"
+        kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "auto"
+        swa_dtype = torch.uint8 if kv_cache_dtype != "bfloat16" else torch.bfloat16
+
         # TODO(yifan): currently hardcoded for FP8 sparse, make it more generic
-        head_bytes = (
-            self.nope_head_dim  # 448 fp8 NoPE
-            + self.rope_head_dim * 2  # 64 bf16 RoPE
-            + self.nope_head_dim // 64  # 7B scale factors
-            + 1  # 1B pad
-        )
+        if swa_dtype == torch.uint8:
+            head_bytes = (
+                self.nope_head_dim  # 448 fp8 NoPE
+                + self.rope_head_dim * 2  # 64 bf16 RoPE
+                + self.nope_head_dim // 64  # 7B scale factors
+                + 1  # 1B pad
+            )
+        else:
+            head_bytes = self.head_dim * 2  # all BF16
 
         # Will be None on ROCm for now.
         self.aux_stream_list = mla_modules.aux_stream_list
@@ -230,11 +449,10 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # before post-GEMM starts.
         self.ln_events = [torch.cuda.Event() for _ in range(4)]
 
-        assert cache_config is not None, "DeepseekV4 attention requires cache_config"
         self.swa_cache_layer = DeepseekV4SWACache(
             head_dim=self.head_dim,
             window_size=self.window_size,
-            dtype=torch.uint8,
+            dtype=swa_dtype,
             prefix=f"{prefix}.swa_cache",
             cache_config=cache_config,
         )
@@ -279,6 +497,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 rotate=True,
                 prefix=f"{prefix}.compressor",
                 k_cache_prefix=self.mla_attn.prefix,
+                use_bf16_cache=(kv_cache_dtype == "bfloat16"),
             )
 
     def forward(
@@ -318,35 +537,73 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
             return self.wo_b(z.flatten(1))
 
-        # O projection: inverse RoPE + FP8 quant + einsum + wo_b
-        o_fp8, o_scale = fused_inv_rope_fp8_quant(
-            o,
-            positions,
-            self.rotary_emb.cos_sin_cache,
-            n_groups=self.n_local_groups,
-            heads_per_group=self.n_local_heads // self.n_local_groups,
-            nope_dim=self.nope_head_dim,
-            rope_dim=self.rope_head_dim,
-            tma_aligned_scales=self._tma_aligned_scales,
-        )
+        # O projection: inverse RoPE + einsum + wo_b
+        if hasattr(self.wo_a, "weight_scale_inv"):
+            # FP8 path: quant activation then fp8 einsum
+            o_fp8, o_scale = fused_inv_rope_fp8_quant(
+                o,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                n_groups=self.n_local_groups,
+                heads_per_group=self.n_local_heads // self.n_local_groups,
+                nope_dim=self.nope_head_dim,
+                rope_dim=self.rope_head_dim,
+                tma_aligned_scales=self._tma_aligned_scales,
+            )
 
-        wo_a_fp8 = self.wo_a.weight
-        wo_a_scale = self.wo_a.weight_scale_inv
+            wo_a_fp8 = self.wo_a.weight
+            wo_a_scale = self.wo_a.weight_scale_inv
 
-        z = torch.empty(
-            (num_tokens, self.n_local_groups, self.o_lora_rank),
-            device=o.device,
-            dtype=torch.bfloat16,
-        )
-        torch.ops.vllm.deepseek_v4_fp8_einsum(
-            o_fp8,
-            o_scale,
-            wo_a_fp8,
-            wo_a_scale,
-            z,
-            "bhr,hdr->bhd",
-            list(self._einsum_recipe),
-        )
+            z = torch.empty(
+                (num_tokens, self.n_local_groups, self.o_lora_rank),
+                device=o.device,
+                dtype=torch.bfloat16,
+            )
+            torch.ops.vllm.deepseek_v4_fp8_einsum(
+                o_fp8,
+                o_scale,
+                wo_a_fp8,
+                wo_a_scale,
+                z,
+                "bhr,hdr->bhd",
+                list(self._einsum_recipe),
+            )
+        else:
+            # BF16 path: inverse RoPE in-place then bf16 einsum
+            rope_dim = self.rope_head_dim
+            cos_sin = self.rotary_emb.cos_sin_cache[positions].to(o.dtype)
+            half_rope = rope_dim // 2
+            cos = cos_sin[:, :half_rope]  # [num_tokens, half_rope]
+            sin = cos_sin[:, half_rope:]  # [num_tokens, half_rope]
+
+            # Apply inverse RoPE to the rope portion of o
+            # DeepseekV4 uses is_neox_style=False (interleaved pairs)
+            # Rope portion starts at nope_head_dim within each head
+            o_rope = o[:, :, self.nope_head_dim:]  # [B, H, rope_dim]
+            # Interleaved pairs: (x0,x1), (x2,x3), ...
+            o_even = o_rope[:, :, 0::2]  # [B, H, half_rope]
+            o_odd = o_rope[:, :, 1::2]   # [B, H, half_rope]
+            # Inverse rotation (conjugate): cos unchanged, sin negated
+            cos_e = cos.unsqueeze(1)  # [B, 1, half_rope]
+            sin_e = sin.unsqueeze(1)  # [B, 1, half_rope]
+            new_even = o_even * cos_e + o_odd * sin_e
+            new_odd = -o_even * sin_e + o_odd * cos_e
+            # Interleave back
+            o_rope_new = torch.stack([new_even, new_odd], dim=-1).flatten(-2)
+            o = torch.cat([
+                o[:, :, :self.nope_head_dim],
+                o_rope_new
+            ], dim=-1)
+
+            # Grouped einsum: [B, G, H/G*D] x [G, R, H/G*D] -> [B, G, R]
+            hpg = self.n_local_heads // self.n_local_groups
+            o_grouped = o.view(num_tokens, self.n_local_groups,
+                              hpg * self.head_dim)
+            # wo_a.weight: [n_local_groups * o_lora_rank, hpg * head_dim]
+            wo_a_w = self.wo_a.weight.view(
+                self.n_local_groups, self.o_lora_rank,
+                hpg * self.head_dim)
+            z = torch.einsum("bgr,gdr->bgd", o_grouped, wo_a_w)
 
         return self.wo_b(z.flatten(1))
 
@@ -538,20 +795,35 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         swa_kv_cache = self.swa_cache_layer.kv_cache
         swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
 
-        # Horizontally fused:
-        #   Q side:  q_head_norm (per-head RMSNorm, no weight) + GPT-J RoPE
-        #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert
-        # kv is unchanged; mla_attn reads kv solely via swa_kv_cache.
-        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-            q,
-            kv,
-            swa_kv_cache_2d,
-            swa_metadata.slot_mapping,
-            positions.to(torch.int64),
-            self.rotary_emb.cos_sin_cache,
-            self.eps,
-            swa_metadata.block_size,
-        )
+        if self.swa_cache_layer.dtype == torch.uint8:
+            # FP8 path: Horizontally fused:
+            #   Q side:  q_head_norm (per-head RMSNorm, no weight) + GPT-J RoPE
+            #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert
+            # kv is unchanged; mla_attn reads kv solely via swa_kv_cache.
+            torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+                q,
+                kv,
+                swa_kv_cache_2d,
+                swa_metadata.slot_mapping,
+                positions.to(torch.int64),
+                self.rotary_emb.cos_sin_cache,
+                self.eps,
+                swa_metadata.block_size,
+            )
+        else:
+            # BF16 path: Q norm + RoPE in-place, KV RoPE + BF16 cache insert
+            _bf16_qnorm_rope_kv_insert(
+                q,
+                kv,
+                swa_kv_cache_2d,
+                swa_metadata.slot_mapping,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.eps,
+                swa_metadata.block_size,
+                self.nope_head_dim,
+                self.rope_head_dim,
+            )
 
 
 @eager_break_during_capture
@@ -689,13 +961,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             vllm_config.scheduler_config.max_num_batched_tokens
         )
         self.max_model_len = vllm_config.model_config.max_model_len
-        # DeepseekV4 only supports fp8 kv-cache format for now.
-        kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "fp8"
-
-        assert kv_cache_dtype.startswith("fp8"), (
-            f"DeepseekV4 only supports fp8 kv-cache format for now, "
-            f"got {kv_cache_dtype}"
-        )
+        kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "auto"
+        if kv_cache_dtype == "auto":
+            kv_cache_dtype = "fp8"
+            if cache_config is not None:
+                cache_config.cache_dtype = kv_cache_dtype
         assert issubclass(self.get_attn_backend(), FlashMLASparseBackend), (
             "Only FlashMLA Sparse Attention backend is supported for DeepseekV4 for now"
         )
@@ -712,6 +982,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             logger.info_once("Using DeepSeek's fp8_ds_mla KV cache format.")
 
         self.kv_cache_dtype = kv_cache_dtype
+        self.use_fp8_kv_cache = (kv_cache_dtype == "fp8_ds_mla")
 
         # Register with compilation context for metadata lookup
         compilation_config = vllm_config.compilation_config
@@ -740,10 +1011,10 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
-            dtype=torch.uint8,
+            dtype=torch.uint8 if self.use_fp8_kv_cache else torch.bfloat16,
             compress_ratio=self.compress_ratio,
             cache_dtype_str=self.kv_cache_dtype,
-            alignment=576,  # NOTE: FlashMLA requires 576B alignment
+            alignment=576 if self.use_fp8_kv_cache else self.head_dim * 2,
             model_version="deepseek_v4",
         )
 
@@ -863,47 +1134,58 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         if kv_cache is not None:
             kv_cache = kv_cache.unsqueeze(-2)
 
-        # One FlashMLASchedMeta per layer type, shared across all same-type
-        # layers within this decode step. The first forward call per type
-        # triggers the in-kernel planner (allocating tile_scheduler_metadata
-        # and num_splits via PyTorch's graph-aware allocator so CUDA graph
-        # capture reuses the same addresses on replay); subsequent same-type
-        # layers see have_initialized=True and skip the planner.
-        if self.compress_ratio <= 1:
-            tile_metadata = swa_metadata.tile_sched_swaonly
-        elif self.compress_ratio == 4:
-            tile_metadata = swa_metadata.tile_sched_c4a
-        elif self.compress_ratio == 128:
-            tile_metadata = swa_metadata.tile_sched_c128a
-        else:
-            raise ValueError(
-                f"Unsupported compress_ratio={self.compress_ratio}; "
-                "expected 1, 4, or 128."
+        if self.use_fp8_kv_cache:
+            # FP8 path: use FlashMLA CUDA kernel (sparse decode)
+            if self.compress_ratio <= 1:
+                tile_metadata = swa_metadata.tile_sched_swaonly
+            elif self.compress_ratio == 4:
+                tile_metadata = swa_metadata.tile_sched_c4a
+            elif self.compress_ratio == 128:
+                tile_metadata = swa_metadata.tile_sched_c128a
+            else:
+                raise ValueError(
+                    f"Unsupported compress_ratio={self.compress_ratio}; "
+                    "expected 1, 4, or 128."
+                )
+            assert tile_metadata is not None, (
+                "swa_metadata missing tile_sched entry for "
+                f"compress_ratio={self.compress_ratio}; "
+                "DeepseekSparseSWAMetadataBuilder.build_tile_scheduler did not "
+                "allocate one for this layer type."
             )
-        assert tile_metadata is not None, (
-            "swa_metadata missing tile_sched entry for "
-            f"compress_ratio={self.compress_ratio}; "
-            "DeepseekSparseSWAMetadataBuilder.build_tile_scheduler did not "
-            "allocate one for this layer type."
-        )
 
-        out, _ = flash_mla_with_kvcache(
-            q=q,
-            k_cache=swa_cache,
-            block_table=None,
-            head_dim_v=512,
-            tile_scheduler_metadata=tile_metadata,
-            cache_seqlens=None,
-            is_fp8_kvcache=True,
-            indices=swa_indices,
-            topk_length=swa_lens,
-            softmax_scale=self.scale,
-            attn_sink=self.attn_sink,
-            extra_k_cache=kv_cache if not swa_only else None,
-            extra_indices_in_kvcache=topk_indices,
-            extra_topk_length=topk_lens,
-            out=output.unsqueeze(1),
-        )
+            out, _ = flash_mla_with_kvcache(
+                q=q,
+                k_cache=swa_cache,
+                block_table=None,
+                head_dim_v=512,
+                tile_scheduler_metadata=tile_metadata,
+                cache_seqlens=None,
+                is_fp8_kvcache=True,
+                indices=swa_indices,
+                topk_length=swa_lens,
+                softmax_scale=self.scale,
+                attn_sink=self.attn_sink,
+                extra_k_cache=kv_cache if not swa_only else None,
+                extra_indices_in_kvcache=topk_indices,
+                extra_topk_length=topk_lens,
+                out=output.unsqueeze(1),
+            )
+        else:
+            # BF16 path: pure-PyTorch sparse decode (correctness prototype)
+            _bf16_sparse_decode(
+                q=q,
+                swa_cache=swa_cache,
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
+                softmax_scale=self.scale,
+                attn_sink=self.attn_sink,
+                head_dim_v=512,
+                extra_k_cache=kv_cache if not swa_only else None,
+                extra_indices=topk_indices,
+                extra_lens=topk_lens,
+                output=output.unsqueeze(1),
+            )
 
     def _forward_prefill(
         self,
@@ -1091,6 +1373,8 @@ class DeepseekV4Indexer(nn.Module):
         self.q_lora_rank = q_lora_rank  # 1536
         self.compress_ratio = compress_ratio
         self.use_fp4_kv = self.vllm_config.attention_config.use_fp4_indexer_cache
+        kv_cache_dtype_str = cache_config.cache_dtype if cache_config else "auto"
+        self.use_bf16_kv = (kv_cache_dtype_str == "bfloat16")
         logger.info_once(
             "Using %s indexer cache for Lightning Indexer.",
             "MXFP4" if self.use_fp4_kv else "FP8",
@@ -1131,10 +1415,15 @@ class DeepseekV4Indexer(nn.Module):
         # head_dim bytes = 128 fp8 + 4 fp32 scale = 132.
         # For FP4 indexer cache, we still allocate the same amount of memory as FP8,
         # but only use the first half of the memory.
-        k_cache_head_dim = self.head_dim + self.head_dim // self.quant_block_size * 4
+        if self.use_bf16_kv:
+            k_cache_head_dim = self.head_dim  # bf16 elements
+            k_cache_dtype = torch.bfloat16
+        else:
+            k_cache_head_dim = self.head_dim + self.head_dim // self.quant_block_size * 4
+            k_cache_dtype = torch.uint8
         self.k_cache = DeepseekV4IndexerCache(
             head_dim=k_cache_head_dim,
-            dtype=torch.uint8,
+            dtype=k_cache_dtype,
             prefix=f"{prefix}.k_cache",
             cache_config=cache_config,
             compress_ratio=self.compress_ratio,
@@ -1148,6 +1437,7 @@ class DeepseekV4Indexer(nn.Module):
             prefix=f"{prefix}.compressor",
             k_cache_prefix=self.k_cache.prefix,
             use_fp4_cache=self.use_fp4_kv,
+            use_bf16_cache=self.use_bf16_kv,
         )
 
         self.indexer_op = SparseAttnIndexer(
@@ -1161,6 +1451,7 @@ class DeepseekV4Indexer(nn.Module):
             self.topk_indices_buffer,
             skip_k_cache_insert=True,
             use_fp4_cache=self.use_fp4_kv,
+            use_bf16_cache=self.use_bf16_kv,
         )
 
     def forward(
@@ -1184,5 +1475,6 @@ class DeepseekV4Indexer(nn.Module):
             self.softmax_scale,
             self.n_head**-0.5,
             use_fp4=self.use_fp4_kv,
+            use_bf16=self.use_bf16_kv,
         )
         return self.indexer_op(hidden_states, q_quant, k, weights)

@@ -472,5 +472,11 @@ def has_fbgemm_gpu() -> bool:
 
 
 def has_cutedsl() -> bool:
-    """Whether the optional `cutelass` package is available."""
-    return _has_module("cutlass")
+    """Whether the optional `cutlass` package is available with required features."""
+    if not _has_module("cutlass"):
+        return False
+    try:
+        import cutlass.cute.nvgpu as nvgpu
+        return hasattr(nvgpu, "LoadCacheMode")
+    except (ImportError, AttributeError):
+        return False

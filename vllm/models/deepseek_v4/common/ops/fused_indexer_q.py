@@ -290,6 +290,7 @@ def fused_indexer_q_rope_quant(
     index_weights_softmax_scale: float,
     index_weights_head_scale: float,
     use_fp4: bool = False,
+    use_bf16: bool = False,
 ) -> tuple[
     torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     torch.Tensor,
@@ -327,6 +328,34 @@ def fused_indexer_q_rope_quant(
     index_q_head_dim = index_q.shape[2]
 
     index_weights_out = torch.empty_like(index_weights, dtype=torch.float32)
+
+    if use_bf16:
+        # BF16 path: apply RoPE only, no quantization. Return BF16 Q.
+        half_rot = index_q_cos_sin_cache.shape[-1] // 2
+        rope_dim = half_rot * 2
+        nope_dim = index_q_head_dim - rope_dim
+
+        index_q_bf16 = index_q.clone()
+        cos = index_q_cos_sin_cache[positions, :half_rot]  # [T, half_rot]
+        sin = index_q_cos_sin_cache[positions, half_rot:]  # [T, half_rot]
+
+        # GPT-J RoPE on rope portion (last rope_dim elements)
+        rope_part = index_q_bf16[:, :, nope_dim:].float()  # [T, H, rope_dim]
+        even = rope_part[:, :, 0::2]  # [T, H, half_rot]
+        odd = rope_part[:, :, 1::2]   # [T, H, half_rot]
+        cos_e = cos[:, None, :]  # [T, 1, half_rot]
+        sin_e = sin[:, None, :]  # [T, 1, half_rot]
+        new_even = even * cos_e - odd * sin_e
+        new_odd = odd * cos_e + even * sin_e
+        index_q_bf16[:, :, nope_dim + 0::2] = new_even.to(index_q.dtype)
+        index_q_bf16[:, :, nope_dim + 1::2] = new_odd.to(index_q.dtype)
+
+        # Fold scales into weights (same as FP8 path but q_scale=1.0)
+        index_weights_out.copy_(
+            index_weights.float() * index_weights_softmax_scale
+            * index_weights_head_scale
+        )
+        return index_q_bf16, index_weights_out
 
     if use_fp4:
         assert index_q_head_dim % MXFP4_BLOCK_SIZE == 0, (

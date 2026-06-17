@@ -181,6 +181,7 @@ class DeepseekCompressor(nn.Module):
         prefix: str = "",
         k_cache_prefix="",
         use_fp4_cache: bool = False,
+        use_bf16_cache: bool = False,
     ):
         super().__init__()
         self.compress_ratio = compress_ratio
@@ -190,6 +191,7 @@ class DeepseekCompressor(nn.Module):
         self.prefix = prefix
         self.k_cache_prefix = k_cache_prefix
         self.use_fp4_cache = use_fp4_cache
+        self.use_bf16_cache = use_bf16_cache
 
         config = vllm_config.model_config.hf_config
         self.rope_head_dim = config.qk_rope_head_dim
@@ -236,7 +238,14 @@ class DeepseekCompressor(nn.Module):
             vllm_config.compilation_config.static_forward_context
         )
 
-        if self.head_dim == 512:
+        if self.use_bf16_cache:
+            # BF16 path: no quantization, store bf16 directly
+            self._fused_kernel = None  # handled in forward()
+            self._quant_block = 0
+            self._token_stride = self.head_dim * 2  # bf16 bytes
+            self._scale_dim = 0
+            self._num_warps = 4
+        elif self.head_dim == 512:
             assert not use_fp4_cache, (
                 "MXFP4 cache is only supported for indexer (head=128)"
             )
@@ -324,7 +333,7 @@ class DeepseekCompressor(nn.Module):
             **pdl_kwargs,
         )
 
-        # Fused: compress → RMSNorm → RoPE → FP8 quant → KV cache write.
+        # Fused: compress → RMSNorm → RoPE → quant → KV cache write.
         # RoPE requirements (kernel applies forward GPT-J style rotation):
         # - is_neox_style=False (interleaved pairs, NOT split-half)
         # - cos_sin_cache layout: [max_pos, rope_head_dim] with first half cos,
@@ -335,43 +344,166 @@ class DeepseekCompressor(nn.Module):
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         kv_cache = self._static_forward_context[self.k_cache_prefix].kv_cache
 
-        self._fused_kernel[(num_actual,)](
-            # state cache
-            state_cache,
-            state_cache.stride(0),
-            state_cache.stride(1),
-            # metadata
-            token_to_req_indices,
-            positions,
-            slot_mapping,
-            block_table,
-            block_table.stride(0),
-            block_size,
-            # RMSNorm
-            self.norm.weight,
-            self.rms_norm_eps,
-            # RoPE
-            cos_sin_cache,
-            cos_sin_cache.stride(0),
-            # KV cache
-            kv_cache,
-            k_cache_metadata.slot_mapping,
-            kv_cache.shape[1],  # paged KV cache block size (tokens per block)
-            # constexprs
-            HEAD_SIZE=self.head_dim,
-            TRITON_BLOCK_SIZE=triton.next_power_of_2(self.head_dim),
-            STATE_WIDTH=state_width,
-            COMPRESS_RATIO=self.compress_ratio,
-            OVERLAP=self.overlap,
-            ROPE_HEAD_DIM=self.rope_head_dim,
-            FP8_MAX=448.0,
-            QUANT_BLOCK=self._quant_block,
-            TOKEN_STRIDE=self._token_stride,
-            SCALE_DIM=self._scale_dim,
-            KV_BLOCK_STRIDE=kv_cache.stride(0),
-            num_warps=self._num_warps,
-            **pdl_kwargs,
-        )
+        if self.use_bf16_cache:
+            _compressor_bf16_norm_rope_insert(
+                state_cache=state_cache,
+                token_to_req_indices=token_to_req_indices,
+                positions=positions,
+                slot_mapping=slot_mapping,
+                block_table=block_table,
+                block_size=block_size,
+                norm_weight=self.norm.weight,
+                rms_norm_eps=self.rms_norm_eps,
+                cos_sin_cache=cos_sin_cache,
+                kv_cache=kv_cache,
+                kv_slot_mapping=k_cache_metadata.slot_mapping,
+                kv_cache_block_size=kv_cache.shape[1],
+                head_dim=self.head_dim,
+                state_width=state_width,
+                compress_ratio=self.compress_ratio,
+                overlap=self.overlap,
+                rope_head_dim=self.rope_head_dim,
+                num_actual=num_actual,
+            )
+        else:
+            self._fused_kernel[(num_actual,)](
+                # state cache
+                state_cache,
+                state_cache.stride(0),
+                state_cache.stride(1),
+                # metadata
+                token_to_req_indices,
+                positions,
+                slot_mapping,
+                block_table,
+                block_table.stride(0),
+                block_size,
+                # RMSNorm
+                self.norm.weight,
+                self.rms_norm_eps,
+                # RoPE
+                cos_sin_cache,
+                cos_sin_cache.stride(0),
+                # KV cache
+                kv_cache,
+                k_cache_metadata.slot_mapping,
+                kv_cache.shape[1],  # paged KV cache block size (tokens per block)
+                # constexprs
+                HEAD_SIZE=self.head_dim,
+                TRITON_BLOCK_SIZE=triton.next_power_of_2(self.head_dim),
+                STATE_WIDTH=state_width,
+                COMPRESS_RATIO=self.compress_ratio,
+                OVERLAP=self.overlap,
+                ROPE_HEAD_DIM=self.rope_head_dim,
+                FP8_MAX=448.0,
+                QUANT_BLOCK=self._quant_block,
+                TOKEN_STRIDE=self._token_stride,
+                SCALE_DIM=self._scale_dim,
+                KV_BLOCK_STRIDE=kv_cache.stride(0),
+                num_warps=self._num_warps,
+                **pdl_kwargs,
+            )
+
+
+def _compressor_bf16_norm_rope_insert(
+    state_cache: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    norm_weight: torch.Tensor,
+    rms_norm_eps: float,
+    cos_sin_cache: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_slot_mapping: torch.Tensor,
+    kv_cache_block_size: int,
+    head_dim: int,
+    state_width: int,
+    compress_ratio: int,
+    overlap: bool,
+    rope_head_dim: int,
+    num_actual: int,
+) -> None:
+    """BF16 fallback for compress → RMSNorm → RoPE → BF16 cache insert."""
+    nope_head_dim = head_dim - rope_head_dim
+    half_rot = rope_head_dim // 2
+    coff = 2 if overlap else 1
+
+    for tok_idx in range(num_actual):
+        slot_id = slot_mapping[tok_idx].item()
+        if slot_id < 0:
+            continue
+        position = positions[tok_idx].item()
+        if (position + 1) % compress_ratio != 0:
+            continue
+
+        req_idx = token_to_req_indices[tok_idx].item()
+
+        # Gather state cache entries for compression
+        start = position - (1 + int(overlap)) * compress_ratio + 1
+        compressed_kv = torch.zeros(head_dim, dtype=torch.float32,
+                                    device=state_cache.device)
+        total_weight = torch.zeros(head_dim, dtype=torch.float32,
+                                   device=state_cache.device)
+
+        # Collect states and scores for softmax-weighted sum
+        num_entries = (1 + int(overlap)) * compress_ratio
+        kv_entries = []
+        score_entries = []
+        for i in range(num_entries):
+            pos = start + i
+            if pos < 0:
+                continue
+            block_idx_val = pos // block_size
+            block_offset = pos % block_size
+            block_num = block_table[req_idx, block_idx_val].item()
+            head_offset = head_dim if i >= compress_ratio else 0
+
+            kv_val = state_cache[block_num, block_offset,
+                                 head_offset:head_offset + head_dim].float()
+            score_val = state_cache[block_num, block_offset,
+                                    state_width + head_offset:
+                                    state_width + head_offset + head_dim].float()
+            kv_entries.append(kv_val)
+            score_entries.append(score_val)
+
+        if not kv_entries:
+            continue
+
+        # Softmax over scores, weighted sum of kv
+        scores = torch.stack(score_entries, dim=0)  # [N, head_dim]
+        scores = torch.softmax(scores, dim=0)
+        kvs = torch.stack(kv_entries, dim=0)  # [N, head_dim]
+        compressed_kv = (kvs * scores).sum(dim=0)  # [head_dim]
+
+        # RMSNorm
+        variance = compressed_kv.pow(2).mean()
+        compressed_kv = compressed_kv * torch.rsqrt(variance + rms_norm_eps)
+        compressed_kv = compressed_kv * norm_weight.float()
+
+        # GPT-J RoPE on last rope_head_dim elements
+        rope_pos = (position // compress_ratio) * compress_ratio
+        cos = cos_sin_cache[rope_pos, :half_rot].float()
+        sin = cos_sin_cache[rope_pos, half_rot:rope_head_dim].float()
+
+        rope_part = compressed_kv[nope_head_dim:]
+        even = rope_part[0::2]
+        odd = rope_part[1::2]
+        new_even = even * cos - odd * sin
+        new_odd = odd * cos + even * sin
+        compressed_kv[nope_head_dim + 0::2] = new_even
+        compressed_kv[nope_head_dim + 1::2] = new_odd
+
+        # BF16 cache insert
+        kv_slot_idx = kv_slot_mapping[tok_idx].item()
+        if kv_slot_idx < 0:
+            continue
+        kv_block_idx = kv_slot_idx // kv_cache_block_size
+        kv_pos_in_block = kv_slot_idx % kv_cache_block_size
+
+        # kv_cache is [num_blocks, block_size, head_dim] bf16
+        kv_cache[kv_block_idx, kv_pos_in_block] = compressed_kv.to(torch.bfloat16)
 
 
 @triton.jit

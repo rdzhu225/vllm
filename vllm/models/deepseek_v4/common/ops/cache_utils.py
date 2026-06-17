@@ -304,6 +304,30 @@ def _dequantize_and_gather_k_kernel(
             tl.store(output_row_ptr + bf16_output_offset + chunk_offsets, bf16_vals)
 
 
+def _gather_bf16_k_cache(
+    out: torch.Tensor,
+    k_cache: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor | None,
+    block_table: torch.Tensor,
+    block_size: int,
+    offset: int,
+) -> None:
+    """Gather BF16 KV cache into output buffer. No dequantization needed."""
+    num_reqs = seq_lens.shape[0]
+    head_dim = k_cache.shape[2]
+
+    for req_idx in range(num_reqs):
+        seq_len = seq_lens[req_idx].item()
+        gather_len = gather_lens[req_idx].item() if gather_lens is not None else seq_len
+        for tok_idx in range(gather_len):
+            src_pos = seq_len - gather_len + tok_idx
+            block_idx = src_pos // block_size
+            pos_in_block = src_pos % block_size
+            block_num = block_table[req_idx, block_idx].item()
+            out[req_idx, offset + tok_idx, :head_dim] = k_cache[block_num, pos_in_block]
+
+
 def dequantize_and_gather_k_cache_triton(
     # [num_reqs, max_num_tokens, head_size]
     out: torch.Tensor,
@@ -364,6 +388,13 @@ def dequantize_and_gather_k_cache(
     block_size: int,
     offset: int,
 ) -> None:
+    # BF16 cache: no dequantization needed, just gather
+    if k_cache.dtype == torch.bfloat16:
+        _gather_bf16_k_cache(
+            out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
+        )
+        return
+
     if has_cutedsl():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (

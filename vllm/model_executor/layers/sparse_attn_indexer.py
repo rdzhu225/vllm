@@ -428,6 +428,7 @@ class SparseAttnIndexer(CustomOp):
         topk_indices_buffer: torch.Tensor,
         skip_k_cache_insert: bool = False,
         use_fp4_cache: bool = False,
+        use_bf16_cache: bool = False,
     ):
         super().__init__()
         self.k_cache = k_cache
@@ -440,7 +441,8 @@ class SparseAttnIndexer(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
-        if current_platform.is_cuda() and not has_deep_gemm():
+        self.use_bf16_cache = use_bf16_cache
+        if current_platform.is_cuda() and not has_deep_gemm() and not use_bf16_cache:
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
             )
@@ -452,6 +454,8 @@ class SparseAttnIndexer(CustomOp):
         k: torch.Tensor,
         weights: torch.Tensor,
     ):
+        if self.use_bf16_cache:
+            return self.forward_bf16(hidden_states, q_quant, k, weights)
         if current_platform.is_cuda() or current_platform.is_xpu():
             return self.forward_cuda(hidden_states, q_quant, k, weights)
         elif current_platform.is_rocm():
@@ -469,6 +473,8 @@ class SparseAttnIndexer(CustomOp):
         k: torch.Tensor,
         weights: torch.Tensor,
     ):
+        if self.use_bf16_cache:
+            return self.forward_bf16(hidden_states, q_quant, k, weights)
         # FP8 path: single tensor (per-token scale is folded into `weights`).
         # FP4 path: (values, scales) tuple with scales required by the kernel.
         if isinstance(q_quant, tuple):
@@ -493,6 +499,165 @@ class SparseAttnIndexer(CustomOp):
             self.skip_k_cache_insert,
             self.use_fp4_cache,
         )
+
+    def forward_bf16(
+        self,
+        hidden_states: torch.Tensor,
+        q_quant: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        k: torch.Tensor,
+        weights: torch.Tensor,
+    ):
+        """BF16 fallback: compute Q×K logits via torch.matmul, then top-k."""
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return sparse_attn_indexer_fake(
+                hidden_states,
+                _encode_layer_name(self.k_cache.prefix),
+                self.k_cache.kv_cache,
+                q_quant if not isinstance(q_quant, tuple) else q_quant[0],
+                q_quant[1] if isinstance(q_quant, tuple) else None,
+                k,
+                weights,
+                self.quant_block_size,
+                self.scale_fmt,
+                self.topk_tokens,
+                self.head_dim,
+                self.max_model_len,
+                self.max_total_seq_len,
+                self.topk_indices_buffer,
+                self.skip_k_cache_insert,
+                False,
+            )
+
+        k_cache_prefix = self.k_cache.prefix
+        kv_cache = self.k_cache.kv_cache
+        attn_metadata_narrowed = attn_metadata[k_cache_prefix]
+        assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
+        slot_mapping = attn_metadata_narrowed.slot_mapping
+        has_decode = attn_metadata_narrowed.num_decodes > 0
+        has_prefill = attn_metadata_narrowed.num_prefills > 0
+        num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
+
+        # q_quant is actually BF16 Q (no quantization)
+        q_bf16 = q_quant if isinstance(q_quant, torch.Tensor) else q_quant[0]
+
+        num_tokens = slot_mapping.shape[0]
+        if k is not None:
+            k = k[:num_tokens]
+
+        # Insert K into BF16 cache
+        if not self.skip_k_cache_insert and k is not None:
+            # kv_cache: [num_blocks, block_size, head_dim] bf16
+            block_size = kv_cache.shape[1]
+            valid_mask = slot_mapping >= 0
+            valid_slots = slot_mapping[valid_mask]
+            valid_k = k[valid_mask]
+            total_slots = kv_cache.shape[0] * block_size
+            cache_flat = kv_cache.view(total_slots, self.head_dim)
+            cache_flat[valid_slots] = valid_k
+
+        self.topk_indices_buffer[: hidden_states.shape[0]] = -1
+
+        if has_prefill:
+            prefill_metadata = attn_metadata_narrowed.prefill
+            assert prefill_metadata is not None
+
+            for chunk in prefill_metadata.chunks:
+                # Gather K from cache for this chunk
+                block_table = chunk.block_table
+                cu_seq_lens_s = chunk.cu_seqlen_ks
+                cu_seq_lens_e = chunk.cu_seqlen_ke
+
+                q_slice = q_bf16[chunk.token_start:chunk.token_end]
+                w_slice = weights[chunk.token_start:chunk.token_end]
+                num_q = q_slice.shape[0]
+
+                # Compute logits per token
+                topk_indices = self.topk_indices_buffer[
+                    chunk.token_start:chunk.token_end, :self.topk_tokens
+                ]
+
+                # Map tokens to sequences: block_table is (num_seqs, max_blocks)
+                # For single-seq chunks, all tokens use block_table[0].
+                # For multi-seq, we need token-to-seq mapping from cu_seqlens.
+                num_seqs = block_table.shape[0]
+
+                for i in range(num_q):
+                    seq_start = cu_seq_lens_s[i].item()
+                    seq_end = cu_seq_lens_e[i].item()
+                    seq_len = seq_end - seq_start
+                    if seq_len <= 0:
+                        continue
+
+                    # Determine which sequence this token belongs to
+                    seq_idx = min(i, num_seqs - 1)
+
+                    # Gather K for this sequence from paged cache
+                    block_size = kv_cache.shape[1]
+                    k_gathered = torch.empty(
+                        seq_len, self.head_dim,
+                        dtype=torch.bfloat16, device=q_slice.device
+                    )
+                    for j in range(seq_len):
+                        global_pos = seq_start + j
+                        block_idx = global_pos // block_size
+                        pos_in_block = global_pos % block_size
+                        block_num = block_table[seq_idx, block_idx].item()
+                        k_gathered[j] = kv_cache[block_num, pos_in_block]
+
+                    # Q×K logits: [H, seq_len]
+                    qi = q_slice[i]  # [H, head_dim]
+                    logits_i = torch.matmul(
+                        qi.float(), k_gathered.float().T
+                    )  # [H, seq_len]
+                    # Weight and sum across heads
+                    wi = w_slice[i]  # [H]
+                    weighted_logits = (logits_i * wi[:, None]).sum(dim=0)  # [seq_len]
+                    # Top-k
+                    k_val = min(self.topk_tokens, seq_len)
+                    _, top_idx = torch.topk(weighted_logits, k_val)
+                    topk_indices[i, :k_val] = (top_idx + seq_start).to(
+                        topk_indices.dtype
+                    )
+
+        if has_decode:
+            decode_metadata = attn_metadata_narrowed.decode
+            assert decode_metadata is not None
+            decode_lens = decode_metadata.decode_lens
+            seq_lens = decode_metadata.seq_lens
+            block_table = decode_metadata.block_table
+            batch_size = seq_lens.shape[0]
+            block_size = kv_cache.shape[1]
+
+            for i in range(min(batch_size, num_decode_tokens)):
+                sl = seq_lens[i, 0].item() if seq_lens.ndim == 2 else seq_lens[i].item()
+                if sl <= 0:
+                    continue
+
+                # Gather K from paged cache
+                k_gathered = torch.empty(
+                    sl, self.head_dim,
+                    dtype=torch.bfloat16, device=q_bf16.device
+                )
+                for j in range(sl):
+                    block_idx = j // block_size
+                    pos_in_block = j % block_size
+                    block_num = block_table[i, block_idx].item()
+                    k_gathered[j] = kv_cache[block_num, pos_in_block]
+
+                qi = q_bf16[i]  # [H, head_dim]
+                logits_i = torch.matmul(
+                    qi.float(), k_gathered.float().T
+                )  # [H, sl]
+                wi = weights[i]  # [H]
+                weighted_logits = (logits_i * wi[:, None]).sum(dim=0)  # [sl]
+                k_val = min(self.topk_tokens, sl)
+                _, top_idx = torch.topk(weighted_logits, k_val)
+                self.topk_indices_buffer[i, :k_val] = top_idx.to(
+                    self.topk_indices_buffer.dtype
+                )
+
+        return self.topk_indices_buffer
 
     def forward_hip(
         self,
