@@ -247,5 +247,15 @@ vllm/grpc/vllm_engine_pb2.py
 vllm/grpc/vllm_engine_pb2_grpc.py
 vllm/grpc/vllm_engine_pb2.pyi
 
-# Ignore generated cpu headers 
+# Ignore generated cpu headers
 csrc/cpu/cpu_attn_dispatch_generated.h
+
+# Local debug / trace / verification scripts (DSV4 INT4 work)
+/debug_int4_*.py
+/trace_int4_*.py
+/test_int4_*.py
+/verify_bf16_vs_fp8.py
+/run_trace.py
+/serve_int4.sh
+/nohup.out
+/PLAN.md
