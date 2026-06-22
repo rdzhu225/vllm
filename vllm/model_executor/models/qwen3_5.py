@@ -78,6 +78,7 @@ from .interfaces import (
     MultiModalEmbeddings,
     SupportsEagle3,
     SupportsLoRA,
+    SupportsMRoPE,
     SupportsPP,
     _require_is_multimodal,
 )
@@ -293,7 +294,14 @@ class Qwen3_5Model(Qwen3NextModel):
             ("in_proj_ba", "in_proj_a", 1),
         ]
 
-        params_dict = dict(self.named_parameters())
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        # W4A8 quantization registers "weight_packed" instead of "weight";
+        # add aliases so checkpoint keys (*.weight) resolve correctly.
+        for k in list(params_dict.keys()):
+            if k.endswith('.weight_packed'):
+                alias = k[:-len('.weight_packed')] + '.weight'
+                if alias not in params_dict:
+                    params_dict[alias] = params_dict[k]
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
         is_fused_expert = False
@@ -332,22 +340,26 @@ class Qwen3_5Model(Qwen3NextModel):
                     is_fused_expert = True
                     expert_params_mapping = fused_expert_params_mapping
 
-                if weight_name not in name:
+                # Use ".weight_name." pattern to avoid false substring matches
+                # e.g., "up_proj" matching inside "gate_up_proj"
+                if f".{weight_name}." not in name:
                     continue
 
                 if "mlp.experts" in name:
                     continue
 
-                name = name.replace(weight_name, param_name)
+                name = name.replace(f".{weight_name}.", f".{param_name}.", 1)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
-                    continue
+                    break
                 # Skip layers on other devices.
                 if is_pp_missing_parameter(name, self):
-                    continue
-                # name = apply_attn_prefix(name, params_dict)
+                    break
                 if name not in params_dict:
-                    continue
+                    logger.warning_once(
+                        f"Mapped parameter {name} not found in params_dict"
+                    )
+                    break
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -443,6 +455,8 @@ class Qwen3_5Model(Qwen3NextModel):
 class Qwen3_5ForCausalLMBase(
     nn.Module,
     HasInnerState,
+    IsHybrid,
+    SupportsMRoPE,
     SupportsEagle3,
     SupportsLoRA,
     SupportsPP,
@@ -535,9 +549,76 @@ class Qwen3_5ForCausalLMBase(
         )
         return loader.load_weights(weights)
 
+    @classmethod
+    def get_mamba_state_dtype_from_config(
+        cls,
+        vllm_config: "VllmConfig",
+    ) -> tuple[torch.dtype, torch.dtype]:
+        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
+        )
+
+    @classmethod
+    def get_mamba_state_shape_from_config(
+        cls, vllm_config: "VllmConfig"
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        parallel_config = vllm_config.parallel_config
+        hf_config = vllm_config.model_config.hf_text_config
+        tp_size = parallel_config.tensor_parallel_size
+        num_spec = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+            tp_size,
+            hf_config.linear_num_key_heads,
+            hf_config.linear_num_value_heads,
+            hf_config.linear_key_head_dim,
+            hf_config.linear_value_head_dim,
+            hf_config.linear_conv_kernel_dim,
+            num_spec,
+        )
+
+    @classmethod
+    def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
+        return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
+
+    def get_mrope_input_positions(
+        self,
+        input_tokens: list[int],
+        mm_features: list,
+    ) -> tuple[torch.Tensor, int]:
+        num_tokens = len(input_tokens)
+        positions = torch.arange(num_tokens, dtype=torch.long)
+        mrope_positions = positions.unsqueeze(0).expand(3, -1)
+        return mrope_positions, 0
+
 
 class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
-    pass
+    """Pure text-only Qwen3.5 model (no vision tower)."""
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load weights with support for language_model. prefix stripping.
+
+        Some quantized Qwen3.5 text models are saved with the multimodal
+        weight structure (model.language_model.*) even though they don't
+        have a vision tower. This strips the language_model. prefix.
+        """
+        def strip_prefix(name: str, tensor: torch.Tensor) -> tuple[str, torch.Tensor]:
+            # Strip model.language_model. -> model.
+            if name.startswith("model.language_model."):
+                name = name.replace("model.language_model.", "model.", 1)
+            return (name, tensor)
+
+        weights = (strip_prefix(name, tensor) for name, tensor in weights)
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=["mtp."],
+        )
+        return loader.load_weights(weights)
 
 
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
