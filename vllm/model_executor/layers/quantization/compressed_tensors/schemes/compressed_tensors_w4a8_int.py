@@ -17,6 +17,7 @@ from vllm.model_executor.parameter import (
     ChannelQuantScaleParameter,
     GroupQuantScaleParameter,
     ModelWeightParameter,
+    PackedvLLMParameter,
 )
 from vllm.scalar_type import scalar_types
 
@@ -24,7 +25,7 @@ logger = init_logger(__name__)
 
 __all__ = ["CompressedTensorsW4A8Int"]
 W4A8_SUPPORTED_TYPES_MAP = {
-    4: scalar_types.int4,
+    4: scalar_types.uint4b8,  # Use uint4b8 for Marlin W4A8 compatibility
 }
 W4A8_SUPPORTED_BITS = list(W4A8_SUPPORTED_TYPES_MAP.keys())
 
@@ -96,7 +97,7 @@ class CompressedTensorsW4A8Int(CompressedTensorsScheme):
                 output_size_per_partition,
             ),
             weight_type=self.quant_type,
-            act_type=params_dtype,
+            act_type=torch.int8,
             group_size=effective_group_size,
             zero_points=False,
             has_g_idx=False,
@@ -145,6 +146,45 @@ class CompressedTensorsW4A8Int(CompressedTensorsScheme):
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # The checkpoint stores one int4 value per int8 byte in [N, K] layout.
+        # Machete/Marlin expect packed uint4b8 int32 data with packed_dim attr.
+        # Convert: int8 [-8,7] -> uint4b8 [0,15] -> pack 8 values per int32.
+        w = layer.weight_packed
+        data = w.data  # [N, K] int8
+
+        # Absorb negative scales into weights so Marlin sees only positive
+        # scales. For groups with negative scale: negate weights and scale.
+        s = layer.weight_scale
+        neg_mask = s.data < 0  # [N, num_groups]
+        if neg_mask.any():
+            group_size = data.shape[1] // s.data.shape[1]
+            neg_expanded = neg_mask.repeat_interleave(group_size, dim=1)
+            data = data.clone()
+            data[neg_expanded] = -data[neg_expanded]
+            # Clamp to valid int4 range after negation (-8 negated is 8 which
+            # overflows int4; clamp to 7)
+            data = data.clamp(-8, 7)
+            s.data = s.data.abs()
+
+        # int4 -> uint4b8 (add bias of 8)
+        data = (data.to(torch.int32) + 8).clamp(0, 15)
+
+        # Pack along input_dim (dim=1, K dimension): [N, K] -> [N, K//8] int32
+        N, K = data.shape
+        pack_factor = 8
+        assert K % pack_factor == 0
+        data = data.reshape(N, K // pack_factor, pack_factor)
+        packed = torch.zeros(N, K // pack_factor, dtype=torch.int32,
+                             device=data.device)
+        for i in range(pack_factor):
+            packed |= data[:, :, i] << (4 * i)
+
+        # Update weight in-place and add packed_dim attribute for
+        # permute_param_layout_ compatibility
+        w.data = packed
+        w._packed_dim = 1
+        w.packed_dim = 1
+
         self.kernel.process_weights_after_loading(layer)
 
     def apply_weights(
