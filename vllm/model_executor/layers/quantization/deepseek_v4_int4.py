@@ -78,6 +78,10 @@ class DeepseekV4Int4Config(QuantizationConfig):
             "quant_method"
         ) == "deepseek_v4_int4":
             return "deepseek_v4_int4"
+        model_type = getattr(hf_config, "model_type", None)
+        expert_dtype = getattr(hf_config, "expert_dtype", None)
+        if model_type == "deepseek_v4" and expert_dtype == "int4":
+            return "deepseek_v4_int4"
         return None
 
     def get_quant_method(
@@ -154,6 +158,7 @@ class DeepseekV4Int4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w13_weight_scale", w13_scales)
         set_weight_attrs(w13_scales, extra_weight_attrs)
+        w13_scales.quant_method = "group"
 
         # Per-group scales for w2
         w2_scales = torch.nn.Parameter(
@@ -167,6 +172,7 @@ class DeepseekV4Int4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_scales)
         set_weight_attrs(w2_scales, extra_weight_attrs)
+        w2_scales.quant_method = "group"
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
@@ -180,6 +186,17 @@ class DeepseekV4Int4MoEMethod(FusedMoEMethodBase):
         )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        # Convert signed int4 (two's complement stored as val & 0x0F) to
+        # unsigned offset binary (val + 8) expected by the WNA16 kernel
+        # with implicit zero_point=8.
+        for attr in ("w13_weight", "w2_weight"):
+            w = getattr(layer, attr).data
+            low = w & 0x0F
+            high = (w >> 4) & 0x0F
+            low = (low + 8) & 0x0F
+            high = (high + 8) & 0x0F
+            w.copy_(low | (high << 4))
+
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
 
     def apply(

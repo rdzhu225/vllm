@@ -1082,7 +1082,8 @@ def _ensure_block_size_k_divisible(
     """Ensure block_size_k is a divisor of size_k and divisible by group_size.
 
     This ensures BLOCK_SIZE_K compatibility with MoeWNA16 CUDA kernel which
-    requires size_k % BLOCK_SIZE_K == 0 and BLOCK_SIZE_K % group_size == 0.
+    requires size_k % BLOCK_SIZE_K == 0 and BLOCK_SIZE_K % group_size == 0
+    and BLOCK_SIZE_K // group_size in [1, 2, 4, 8].
 
     Args:
         size_k: The size_k dimension that must be divisible by result.
@@ -1092,6 +1093,11 @@ def _ensure_block_size_k_divisible(
     Returns:
         A valid BLOCK_SIZE_K that divides size_k and is divisible by group_size.
     """
+    # Cap block_size_k so that block_size_k // group_size <= 8
+    max_block_size_k = group_size * 8
+    if block_size_k > max_block_size_k:
+        block_size_k = max_block_size_k
+
     # Fast path: already valid
     if size_k % block_size_k == 0 and block_size_k % group_size == 0:
         return block_size_k
