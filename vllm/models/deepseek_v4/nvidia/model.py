@@ -1174,6 +1174,14 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
             re.compile(r"(\.experts\.\d+\.w[123])\.scale$"): r"\1.weight_scale",
             re.compile(r"\.scale$"): ".weight_scale_inv",
         }
+    elif expert_dtype == "int4":
+        # INT4 experts: checkpoint stores scales as
+        # ``experts.{id}.w{1,2,3}.weight.scale`` which maps to
+        # ``w{13,2}_weight_scale`` in the fused MoE layer.
+        scale_regex = {
+            re.compile(r"(\.experts\.\d+\.w[123])\.weight\.scale$"):
+                r"\1.weight_scale",
+        }
     else:
         # FP8 experts use Fp8MoEMethod (block_quant=True), which registers
         # scales as ``w{13,2}_weight_scale_inv``. Map all ``.scale`` keys
@@ -1251,7 +1259,14 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV4MixtureOfExperts):
         config = vllm_config.model_config.hf_config
         self.config = config
         expert_dtype = getattr(config, "expert_dtype", "fp4")
-        if expert_dtype != "fp4":
+
+        # Detect INT4 quantization override
+        from vllm.model_executor.layers.quantization.deepseek_v4_int4 import (
+            DeepseekV4Int4Config,
+        )
+        if isinstance(vllm_config.quant_config, DeepseekV4Int4Config):
+            self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper("int4")
+        elif expert_dtype != "fp4":
             self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(expert_dtype)
 
         self.model = self.model_cls(

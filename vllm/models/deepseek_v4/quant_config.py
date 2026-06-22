@@ -124,6 +124,11 @@ class DeepseekV4FP8Config(Fp8Config):
             and hf_quant_cfg.get("quant_method") in ("fp8", "deepseek_v4_fp8")
         ):
             return None
+        # Don't override if user explicitly chose a different method
+        if user_quant is not None and user_quant not in (
+            "fp8", "deepseek_v4_fp8", None
+        ):
+            return None
         model_type = getattr(hf_config, "model_type", None)
         if model_type == "deepseek_v4" or user_quant == "deepseek_v4_fp8":
             return "deepseek_v4_fp8"
